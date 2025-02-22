@@ -10,6 +10,7 @@ import logging
 from prawcore.exceptions import PrawcoreException, ResponseException, RequestException
 from pymongo.errors import PyMongoError
 from datetime import datetime, timedelta
+from urllib.parse import quote_plus
 
 # Set up logging
 logging.basicConfig(
@@ -25,14 +26,21 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 app = Flask(__name__)
 
-# MongoDB setup with retry logic
+# MongoDB connection with proper retry logic
 def connect_to_mongodb():
     max_retries = 3
     retries = 0
     while retries < max_retries:
         try:
-            client = pymongo.MongoClient(os.getenv('MONGODB_URI'))
-            # Test the connection
+            mongodb_uri = os.getenv('MONGODB_URI')
+            if not mongodb_uri:
+                raise Exception("MONGODB_URI environment variable not set")
+
+            client = pymongo.MongoClient(
+                mongodb_uri,
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=20000
+            )
             client.admin.command('ping')
             logger.info("Successfully connected to MongoDB")
             return client
@@ -43,9 +51,10 @@ def connect_to_mongodb():
                 raise
             time.sleep(5)
 
+# Initialize MongoDB client and collections
 try:
     mongo_client = connect_to_mongodb()
-    db = mongo_client['cricket_bot']
+    db = mongo_client.get_database()
     posts_collection = db['processed_posts']
     comments_collection = db['processed_comments']
     rate_limits_collection = db['rate_limits']
@@ -53,7 +62,7 @@ except Exception as e:
     logger.error(f"Failed to connect to MongoDB after all retries: {e}")
     raise
 
-# Reddit setup
+# Initialize Reddit client
 reddit = praw.Reddit(
     client_id=os.getenv('REDDIT_CLIENT_ID'),
     client_secret=os.getenv('REDDIT_CLIENT_SECRET'),
@@ -126,7 +135,7 @@ def get_gemini_response(text, max_retries=3):
         except requests.exceptions.RequestException as e:
             logger.error(f"Gemini API request error: {e}")
             retries += 1
-            time.sleep(2 ** retries)  # Exponential backoff
+            time.sleep(2 ** retries)
             
         except (KeyError, IndexError) as e:
             logger.error(f"Gemini API response parsing error: {e}")
@@ -136,7 +145,6 @@ def get_gemini_response(text, max_retries=3):
 
 def process_post(post):
     try:
-        # Check if post was already processed
         if posts_collection.find_one({'post_id': post.id}):
             return
 
@@ -157,15 +165,12 @@ def process_post(post):
             })
             logger.info(f"Successfully processed post: {post.id}")
 
-    except (PrawcoreException, ResponseException, RequestException) as e:
-        logger.error(f"Reddit API error while processing post: {e}")
-        time.sleep(60)
     except Exception as e:
-        logger.error(f"Unexpected error in post processing: {e}")
+        logger.error(f"Error in process_post: {e}")
+        time.sleep(60)
 
 def process_comment(comment):
     try:
-        # Check if comment was already processed
         if comments_collection.find_one({'comment_id': comment.id}):
             return
 
@@ -185,60 +190,43 @@ def process_comment(comment):
             })
             logger.info(f"Successfully processed comment: {comment.id}")
 
-    except (PrawcoreException, ResponseException, RequestException) as e:
-        logger.error(f"Reddit API error while processing comment: {e}")
-        time.sleep(60)
     except Exception as e:
-        logger.error(f"Unexpected error in comment processing: {e}")
+        logger.error(f"Error in process_comment: {e}")
+        time.sleep(60)
 
-def stream_with_error_handling(stream, process_func):
+def monitor_posts(subreddit):
     while True:
         try:
-            for item in stream:
-                try:
-                    process_func(item)
-                except Exception as e:
-                    logger.error(f"Error processing item: {e}")
-                    continue
+            for post in subreddit.stream.submissions(skip_existing=True):
+                process_post(post)
         except Exception as e:
-            logger.error(f"Stream error: {e}")
-            time.sleep(60)  # Wait before reconnecting
+            logger.error(f"Error in post stream: {e}")
+            time.sleep(60)
 
-def monitor_subreddit():
+def monitor_comments(subreddit):
+    while True:
+        try:
+            for comment in subreddit.stream.comments(skip_existing=True):
+                if 'u/cricket-bot' in comment.body.lower():
+                    process_comment(comment)
+                
+                try:
+                    parent = comment.parent()
+                    if isinstance(parent, praw.models.Comment) and parent.author and parent.author.name == os.getenv('REDDIT_USERNAME'):
+                        process_comment(comment)
+                except Exception as e:
+                    logger.error(f"Error checking comment parent: {e}")
+        except Exception as e:
+            logger.error(f"Error in comment stream: {e}")
+            time.sleep(60)
+
+def start_bot():
     while True:
         try:
             subreddit = reddit.subreddit('cricket2')
             
-            # Create separate threads for posts and comments
-            def monitor_posts():
-                while True:
-                    try:
-                        for post in subreddit.stream.submissions(skip_existing=True):
-                            process_post(post)
-                    except Exception as e:
-                        logger.error(f"Posts stream error: {e}")
-                        time.sleep(60)
-
-            def monitor_comments():
-                while True:
-                    try:
-                        for comment in subreddit.stream.comments(skip_existing=True):
-                            if 'u/cricket-bot' in comment.body.lower():
-                                process_comment(comment)
-                            
-                            try:
-                                parent = comment.parent()
-                                if isinstance(parent, praw.models.Comment) and parent.author and parent.author.name == os.getenv('REDDIT_USERNAME'):
-                                    process_comment(comment)
-                            except Exception as e:
-                                logger.error(f"Error checking comment parent: {e}")
-                    except Exception as e:
-                        logger.error(f"Comments stream error: {e}")
-                        time.sleep(60)
-
-            # Start monitoring threads
-            posts_thread = Thread(target=monitor_posts)
-            comments_thread = Thread(target=monitor_comments)
+            posts_thread = Thread(target=monitor_posts, args=(subreddit,))
+            comments_thread = Thread(target=monitor_comments, args=(subreddit,))
             
             posts_thread.daemon = True
             comments_thread.daemon = True
@@ -246,20 +234,22 @@ def monitor_subreddit():
             posts_thread.start()
             comments_thread.start()
             
-            # Keep main thread alive
-            while True:
-                time.sleep(60)
-                
+            # Keep threads alive
+            posts_thread.join()
+            comments_thread.join()
+            
         except Exception as e:
-            logger.error(f"Main monitoring error: {e}")
+            logger.error(f"Error in main bot loop: {e}")
             time.sleep(60)
+
+@app.route('/')
+def home():
+    return 'Bot is running'
 
 @app.route('/health')
 def health_check():
     try:
-        # Test MongoDB connection
         mongo_client.admin.command('ping')
-        # Test Reddit connection
         reddit.user.me()
         return {
             'status': 'healthy',
@@ -274,13 +264,10 @@ def health_check():
             'timestamp': datetime.utcnow().isoformat()
         }, 500
 
-def run():
-    monitor_thread = Thread(target=monitor_subreddit)
-    monitor_thread.daemon = True
-    monitor_thread.start()
+if __name__ == '__main__':
+    bot_thread = Thread(target=start_bot)
+    bot_thread.daemon = True
+    bot_thread.start()
     
     port = int(os.getenv('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-
-if __name__ == '__main__':
-    run()
