@@ -25,16 +25,32 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 app = Flask(__name__)
 
-# MongoDB setup with error handling
+# MongoDB setup with retry logic
+def connect_to_mongodb():
+    max_retries = 3
+    retries = 0
+    while retries < max_retries:
+        try:
+            client = pymongo.MongoClient(os.getenv('MONGODB_URI'))
+            # Test the connection
+            client.admin.command('ping')
+            logger.info("Successfully connected to MongoDB")
+            return client
+        except Exception as e:
+            retries += 1
+            logger.error(f"MongoDB connection attempt {retries} failed: {e}")
+            if retries == max_retries:
+                raise
+            time.sleep(5)
+
 try:
-    client = pymongo.MongoClient(os.getenv('MONGODB_URI'), serverSelectionTimeoutMS=5000)
-    client.server_info()  # Test connection
-    db = client['cricket_bot']
+    mongo_client = connect_to_mongodb()
+    db = mongo_client['cricket_bot']
     posts_collection = db['processed_posts']
     comments_collection = db['processed_comments']
     rate_limits_collection = db['rate_limits']
-except PyMongoError as e:
-    logger.error(f"MongoDB connection error: {e}")
+except Exception as e:
+    logger.error(f"Failed to connect to MongoDB after all retries: {e}")
     raise
 
 # Reddit setup
@@ -47,7 +63,7 @@ reddit = praw.Reddit(
 )
 
 class RateLimiter:
-    def __init__(self, collection, limit_per_minute=60):
+    def __init__(self, collection, limit_per_minute=30):
         self.collection = collection
         self.limit_per_minute = limit_per_minute
 
@@ -84,6 +100,7 @@ def get_gemini_response(text, max_retries=3):
     if not rate_limiter.can_proceed("gemini_api"):
         logger.warning("Rate limit reached for Gemini API")
         time.sleep(60)
+        return None
         
     retries = 0
     while retries < max_retries:
@@ -188,45 +205,82 @@ def stream_with_error_handling(stream, process_func):
             time.sleep(60)  # Wait before reconnecting
 
 def monitor_subreddit():
-    subreddit = reddit.subreddit('cricket2')
-    
-    # Create separate threads for posts and comments
-    def monitor_posts():
-        stream_with_error_handling(subreddit.stream.submissions(skip_existing=True), process_post)
+    while True:
+        try:
+            subreddit = reddit.subreddit('cricket2')
+            
+            # Create separate threads for posts and comments
+            def monitor_posts():
+                while True:
+                    try:
+                        for post in subreddit.stream.submissions(skip_existing=True):
+                            process_post(post)
+                    except Exception as e:
+                        logger.error(f"Posts stream error: {e}")
+                        time.sleep(60)
 
-    def monitor_comments():
-        def comment_handler(comment):
-            try:
-                # Check for mentions
-                if 'u/cricket-bot' in comment.body.lower():
-                    process_comment(comment)
+            def monitor_comments():
+                while True:
+                    try:
+                        for comment in subreddit.stream.comments(skip_existing=True):
+                            if 'u/cricket-bot' in comment.body.lower():
+                                process_comment(comment)
+                            
+                            try:
+                                parent = comment.parent()
+                                if isinstance(parent, praw.models.Comment) and parent.author and parent.author.name == os.getenv('REDDIT_USERNAME'):
+                                    process_comment(comment)
+                            except Exception as e:
+                                logger.error(f"Error checking comment parent: {e}")
+                    except Exception as e:
+                        logger.error(f"Comments stream error: {e}")
+                        time.sleep(60)
+
+            # Start monitoring threads
+            posts_thread = Thread(target=monitor_posts)
+            comments_thread = Thread(target=monitor_comments)
+            
+            posts_thread.daemon = True
+            comments_thread.daemon = True
+            
+            posts_thread.start()
+            comments_thread.start()
+            
+            # Keep main thread alive
+            while True:
+                time.sleep(60)
                 
-                # Check for replies to bot's comments
-                parent = comment.parent()
-                if isinstance(parent, praw.models.Comment) and parent.author == os.getenv('REDDIT_USERNAME'):
-                    process_comment(comment)
-            except Exception as e:
-                logger.error(f"Error in comment handler: {e}")
-
-        stream_with_error_handling(subreddit.stream.comments(skip_existing=True), comment_handler)
-
-    # Start monitoring threads
-    posts_thread = Thread(target=monitor_posts)
-    comments_thread = Thread(target=monitor_comments)
-    
-    posts_thread.start()
-    comments_thread.start()
+        except Exception as e:
+            logger.error(f"Main monitoring error: {e}")
+            time.sleep(60)
 
 @app.route('/health')
 def health_check():
-    return {'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()}
+    try:
+        # Test MongoDB connection
+        mongo_client.admin.command('ping')
+        # Test Reddit connection
+        reddit.user.me()
+        return {
+            'status': 'healthy',
+            'timestamp': datetime.utcnow().isoformat(),
+            'mongodb': 'connected',
+            'reddit': 'connected'
+        }
+    except Exception as e:
+        return {
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }, 500
 
-def run_bot():
+def run():
     monitor_thread = Thread(target=monitor_subreddit)
     monitor_thread.daemon = True
     monitor_thread.start()
     
-if __name__ == '__main__':
-    run_bot()
     port = int(os.getenv('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
+
+if __name__ == '__main__':
+    run()
