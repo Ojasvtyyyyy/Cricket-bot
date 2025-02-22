@@ -1,17 +1,15 @@
 import praw
+import pymongo
 import os
+from flask import Flask
 from dotenv import load_dotenv
 import requests
-import pymongo
-from datetime import datetime, timedelta
 import time
-import traceback
+from threading import Thread
 import logging
-from ratelimit import limits, sleep_and_retry
-import sys
-from requests.exceptions import RequestException
-from prawcore.exceptions import PrawcoreException
+from prawcore.exceptions import PrawcoreException, ResponseException, RequestException
 from pymongo.errors import PyMongoError
+from datetime import datetime, timedelta
 
 # Set up logging
 logging.basicConfig(
@@ -19,89 +17,81 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('bot.log'),
-        logging.StreamHandler(sys.stdout)
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+app = Flask(__name__)
 
-# Configuration
-REDDIT_CLIENT_ID = os.getenv('REDDIT_CLIENT_ID')
-REDDIT_CLIENT_SECRET = os.getenv('REDDIT_CLIENT_SECRET')
-REDDIT_REFRESH_TOKEN = os.getenv('REDDIT_REFRESH_TOKEN')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-MONGO_URI = os.getenv('MONGO_URI')
+# MongoDB setup with error handling
+try:
+    client = pymongo.MongoClient(os.getenv('MONGODB_URI'), serverSelectionTimeoutMS=5000)
+    client.server_info()  # Test connection
+    db = client['cricket_bot']
+    posts_collection = db['processed_posts']
+    comments_collection = db['processed_comments']
+    rate_limits_collection = db['rate_limits']
+except PyMongoError as e:
+    logger.error(f"MongoDB connection error: {e}")
+    raise
 
-# Rate limiting configurations
-CALLS_PER_MINUTE = 30  # Reddit API limit
-GEMINI_CALLS_PER_MINUTE = 60  # Gemini API limit
+# Reddit setup
+reddit = praw.Reddit(
+    client_id=os.getenv('REDDIT_CLIENT_ID'),
+    client_secret=os.getenv('REDDIT_CLIENT_SECRET'),
+    user_agent=os.getenv('REDDIT_USER_AGENT'),
+    username=os.getenv('REDDIT_USERNAME'),
+    password=os.getenv('REDDIT_PASSWORD')
+)
 
-class DatabaseManager:
-    def __init__(self, uri):
+class RateLimiter:
+    def __init__(self, collection, limit_per_minute=60):
+        self.collection = collection
+        self.limit_per_minute = limit_per_minute
+
+    def can_proceed(self, action_type):
         try:
-            self.client = pymongo.MongoClient(uri)
-            self.db = self.client['cricket_bot']
-            self.posts = self.db['processed_posts']
-            self.comments = self.db['processed_comments']
-            self.error_log = self.db['error_log']
+            now = datetime.utcnow()
+            one_minute_ago = now - timedelta(minutes=1)
             
-            # Create indexes
-            self.posts.create_index('post_id', unique=True)
-            self.comments.create_index('comment_id', unique=True)
+            # Clean old entries
+            self.collection.delete_many({"timestamp": {"$lt": one_minute_ago}})
             
-            logger.info("Successfully connected to MongoDB")
-        except PyMongoError as e:
-            logger.error(f"MongoDB connection error: {e}")
-            raise
-
-    def log_error(self, error_type, error_message, details=None):
-        try:
-            self.error_log.insert_one({
-                'timestamp': datetime.utcnow(),
-                'type': error_type,
-                'message': str(error_message),
-                'details': details
+            # Count recent actions
+            recent_count = self.collection.count_documents({
+                "action_type": action_type,
+                "timestamp": {"$gte": one_minute_ago}
             })
+            
+            if recent_count >= self.limit_per_minute:
+                return False
+            
+            # Record new action
+            self.collection.insert_one({
+                "action_type": action_type,
+                "timestamp": now
+            })
+            return True
         except PyMongoError as e:
-            logger.error(f"Failed to log error to MongoDB: {e}")
+            logger.error(f"Rate limiter error: {e}")
+            return False
 
-class RedditBot:
-    def __init__(self):
-        if not all([REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_REFRESH_TOKEN, 
-                   GEMINI_API_KEY, MONGO_URI]):
-            raise ValueError("Missing required environment variables")
+rate_limiter = RateLimiter(rate_limits_collection)
+
+def get_gemini_response(text, max_retries=3):
+    if not rate_limiter.can_proceed("gemini_api"):
+        logger.warning("Rate limit reached for Gemini API")
+        time.sleep(60)
         
-        self.db = DatabaseManager(MONGO_URI)
-        self.reddit = self.init_reddit()
-        self.setup_rate_limits()
-
-    def init_reddit(self):
-        try:
-            reddit = praw.Reddit(
-                client_id=REDDIT_CLIENT_ID,
-                client_secret=REDDIT_CLIENT_SECRET,
-                refresh_token=REDDIT_REFRESH_TOKEN,
-                user_agent="Cricket-Bot/1.0"
-            )
-            logger.info("Successfully initialized Reddit instance")
-            return reddit
-        except Exception as e:
-            logger.error(f"Failed to initialize Reddit: {e}")
-            self.db.log_error("Reddit Init", str(e))
-            raise
-
-    def setup_rate_limits(self):
-        self.get_gemini_response = sleep_and_retry(
-            limits(calls=GEMINI_CALLS_PER_MINUTE, period=60)(self.get_gemini_response)
-        )
-
-    def get_gemini_response(self, text):
+    retries = 0
+    while retries < max_retries:
         try:
             prompt = "You are the most funny person on r/cricket. Keep responses really short and quality humour. Be extremely relavent spontaneous savage, and use curses but don't overdo. If asked to choose between options, be extremely decisive and pick one. The message is: " + text
             
             response = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={os.getenv('GEMINI_API_KEY')}",
                 json={
                     "contents": [{"parts": [{"text": prompt}]}],
                     "safetySettings": [
@@ -113,132 +103,130 @@ class RedditBot:
                 },
                 timeout=10
             )
-            
-            if response.status_code != 200:
-                logger.error(f"Gemini API error: {response.status_code} - {response.text}")
-                return None
-                
+            response.raise_for_status()
             return response.json()['candidates'][0]['content']['parts'][0]['text']
-            
-        except RequestException as e:
+        
+        except requests.exceptions.RequestException as e:
             logger.error(f"Gemini API request error: {e}")
-            self.db.log_error("Gemini API", str(e))
+            retries += 1
+            time.sleep(2 ** retries)  # Exponential backoff
+            
+        except (KeyError, IndexError) as e:
+            logger.error(f"Gemini API response parsing error: {e}")
             return None
-        except Exception as e:
-            logger.error(f"Unexpected error in Gemini response: {e}")
-            self.db.log_error("Gemini Unexpected", str(e))
-            return None
-
-    @sleep_and_retry
-    @limits(calls=CALLS_PER_MINUTE, period=60)
-    def process_new_posts(self):
-        try:
-            subreddit = self.reddit.subreddit('cricket2')
-            for post in subreddit.stream.submissions(skip_existing>True):
-                if not self.db.posts.find_one({'post_id': post.id}):
-                    response = self.get_gemini_response(f"{post.title}\n{post.selftext}")
-                    if response:
-                        try:
-                            comment = post.reply(response)
-                            self.db.posts.insert_one({
-                                'post_id': post.id,
-                                'comment_id': comment.id,
-                                'timestamp': datetime.utcnow()
-                            })
-                            logger.info(f"Successfully processed post {post.id}")
-                        except PrawcoreException as e:
-                            logger.error(f"Reddit API error while replying to post: {e}")
-                            self.db.log_error("Reddit Reply", str(e))
-                            time.sleep(60)  # Back off on API errors
-                            
-        except PrawcoreException as e:
-            logger.error(f"Reddit API error in post stream: {e}")
-            self.db.log_error("Reddit Stream", str(e))
-            time.sleep(60)
-        except Exception as e:
-            logger.error(f"Unexpected error in post processing: {e}")
-            self.db.log_error("Post Processing", str(e))
-
-    @sleep_and_retry
-    @limits(calls=CALLS_PER_MINUTE, period=60)
-    def process_comments(self):
-        try:
-            for comment in self.reddit.subreddit('cricket2').stream.comments(skip_existing=True):
-                # Handle mentions
-                if 'u/cricket-bot' in comment.body.lower():
-                    self.handle_mention(comment)
-                # Handle replies
-                elif comment.parent_id:
-                    self.handle_reply(comment)
-                    
-        except PrawcoreException as e:
-            logger.error(f"Reddit API error in comment stream: {e}")
-            self.db.log_error("Comment Stream", str(e))
-            time.sleep(60)
-        except Exception as e:
-            logger.error(f"Unexpected error in comment processing: {e}")
-            self.db.log_error("Comment Processing", str(e))
-
-    def handle_mention(self, comment):
-        try:
-            if not self.db.comments.find_one({'comment_id': comment.id}):
-                response = self.get_gemini_response(comment.body)
-                if response:
-                    reply = comment.reply(response)
-                    self.db.comments.insert_one({
-                        'comment_id': comment.id,
-                        'reply_id': reply.id,
-                        'timestamp': datetime.utcnow()
-                    })
-                    logger.info(f"Successfully processed mention {comment.id}")
-        except Exception as e:
-            logger.error(f"Error handling mention: {e}")
-            self.db.log_error("Mention Handler", str(e))
-
-    def handle_reply(self, comment):
-        try:
-            parent_comment = self.reddit.comment(comment.parent_id[3:])
-            if self.db.comments.find_one({'reply_id': parent_comment.id}):
-                if not self.db.comments.find_one({'comment_id': comment.id}):
-                    response = self.get_gemini_response(comment.body)
-                    if response:
-                        reply = comment.reply(response)
-                        self.db.comments.insert_one({
-                            'comment_id': comment.id,
-                            'reply_id': reply.id,
-                            'timestamp': datetime.utcnow()
-                        })
-                        logger.info(f"Successfully processed reply {comment.id}")
-        except Exception as e:
-            logger.error(f"Error handling reply: {e}")
-            self.db.log_error("Reply Handler", str(e))
-
-def main():
-    max_retries = 3
-    retry_delay = 300  # 5 minutes
     
+    return None
+
+def process_post(post):
+    try:
+        # Check if post was already processed
+        if posts_collection.find_one({'post_id': post.id}):
+            return
+
+        if not rate_limiter.can_proceed("reddit_comment"):
+            logger.warning("Rate limit reached for Reddit comments")
+            time.sleep(60)
+            return
+
+        text = f"{post.title}\n{post.selftext}"
+        response = get_gemini_response(text)
+        
+        if response:
+            comment = post.reply(response)
+            posts_collection.insert_one({
+                'post_id': post.id,
+                'comment_id': comment.id,
+                'timestamp': datetime.utcnow()
+            })
+            logger.info(f"Successfully processed post: {post.id}")
+
+    except (PrawcoreException, ResponseException, RequestException) as e:
+        logger.error(f"Reddit API error while processing post: {e}")
+        time.sleep(60)
+    except Exception as e:
+        logger.error(f"Unexpected error in post processing: {e}")
+
+def process_comment(comment):
+    try:
+        # Check if comment was already processed
+        if comments_collection.find_one({'comment_id': comment.id}):
+            return
+
+        if not rate_limiter.can_proceed("reddit_comment"):
+            logger.warning("Rate limit reached for Reddit comments")
+            time.sleep(60)
+            return
+
+        response = get_gemini_response(comment.body)
+        
+        if response:
+            reply = comment.reply(response)
+            comments_collection.insert_one({
+                'comment_id': comment.id,
+                'reply_id': reply.id,
+                'timestamp': datetime.utcnow()
+            })
+            logger.info(f"Successfully processed comment: {comment.id}")
+
+    except (PrawcoreException, ResponseException, RequestException) as e:
+        logger.error(f"Reddit API error while processing comment: {e}")
+        time.sleep(60)
+    except Exception as e:
+        logger.error(f"Unexpected error in comment processing: {e}")
+
+def stream_with_error_handling(stream, process_func):
     while True:
         try:
-            bot = RedditBot()
-            logger.info("Bot initialized successfully")
-            
-            while True:
+            for item in stream:
                 try:
-                    bot.process_new_posts()
-                    bot.process_comments()
+                    process_func(item)
                 except Exception as e:
-                    logger.error(f"Error in main loop: {e}")
-                    time.sleep(30)
-                    
+                    logger.error(f"Error processing item: {e}")
+                    continue
         except Exception as e:
-            logger.error(f"Critical error: {e}")
-            if max_retries > 0:
-                max_retries -= 1
-                logger.info(f"Retrying in {retry_delay} seconds... ({max_retries} retries left)")
-                time.sleep(retry_delay)
-            else:
-                logger.critical("Max retries exceeded. Shutting down.")
-                sys.exit(1)
+            logger.error(f"Stream error: {e}")
+            time.sleep(60)  # Wait before reconnecting
 
-if __name__ == "__main__":
-    main()
+def monitor_subreddit():
+    subreddit = reddit.subreddit('cricket2')
+    
+    # Create separate threads for posts and comments
+    def monitor_posts():
+        stream_with_error_handling(subreddit.stream.submissions(skip_existing=True), process_post)
+
+    def monitor_comments():
+        def comment_handler(comment):
+            try:
+                # Check for mentions
+                if 'u/cricket-bot' in comment.body.lower():
+                    process_comment(comment)
+                
+                # Check for replies to bot's comments
+                parent = comment.parent()
+                if isinstance(parent, praw.models.Comment) and parent.author == os.getenv('REDDIT_USERNAME'):
+                    process_comment(comment)
+            except Exception as e:
+                logger.error(f"Error in comment handler: {e}")
+
+        stream_with_error_handling(subreddit.stream.comments(skip_existing=True), comment_handler)
+
+    # Start monitoring threads
+    posts_thread = Thread(target=monitor_posts)
+    comments_thread = Thread(target=monitor_comments)
+    
+    posts_thread.start()
+    comments_thread.start()
+
+@app.route('/health')
+def health_check():
+    return {'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()}
+
+def run_bot():
+    monitor_thread = Thread(target=monitor_subreddit)
+    monitor_thread.daemon = True
+    monitor_thread.start()
+    
+if __name__ == '__main__':
+    run_bot()
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
