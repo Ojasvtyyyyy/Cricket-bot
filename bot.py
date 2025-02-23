@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 app = Flask(__name__)
 
-# MongoDB connection with proper retry logic
 def connect_to_mongodb():
     max_retries = 3
     retries = 0
@@ -55,7 +54,6 @@ def connect_to_mongodb():
                 raise
             time.sleep(5)
 
-# Initialize MongoDB client and collections
 try:
     mongo_client, db = connect_to_mongodb()
     posts_collection = db['processed_posts']
@@ -70,11 +68,10 @@ except Exception as e:
     logger.error(f"Failed to connect to MongoDB after all retries: {e}")
     raise
 
-# Initialize Reddit client with OAuth
 reddit = praw.Reddit(
     client_id=os.getenv('REDDIT_CLIENT_ID'),
     client_secret=os.getenv('REDDIT_CLIENT_SECRET'),
-    user_agent="Cricket Bot v1.0 by /u/your_username",  # Replace with your username
+    user_agent=os.getenv('REDDIT_USER_AGENT'),
     refresh_token=os.getenv('REDDIT_REFRESH_TOKEN')
 )
 
@@ -147,6 +144,20 @@ def get_gemini_response(text, max_retries=3):
     
     return None 
 
+def is_valid_post(post):
+    try:
+        # Check if post is available and not removed/deleted
+        return (
+            not post.stickied and  # Not a sticky post
+            hasattr(post, 'author') and  # Has author
+            post.author is not None and  # Author not deleted
+            not post.locked and  # Not locked
+            not hasattr(post, 'removed_by_category')  # Not removed
+        )
+    except Exception as e:
+        logger.error(f"Error checking post validity: {e}")
+        return False
+
 def process_post(post):
     try:
         if posts_collection.find_one({'post_id': post.id}):
@@ -156,6 +167,10 @@ def process_post(post):
         post_age = datetime.utcnow() - datetime.fromtimestamp(post.created_utc)
         if post_age > timedelta(hours=24):
             logger.info(f"Post {post.id} is too old, skipping")
+            return
+
+        if not is_valid_post(post):
+            logger.info(f"Post {post.id} is not valid, skipping")
             return
 
         max_retries = 3
@@ -231,7 +246,7 @@ def monitor_posts(subreddit):
         try:
             logger.info(f"Starting to monitor posts in r/{subreddit.display_name}")
             for post in subreddit.stream.submissions(skip_existing=True):
-                if not post.stickied and not post.removed and not post.spam:
+                if is_valid_post(post):
                     process_post(post)
                 time.sleep(2)
         except PrawcoreException as e:
