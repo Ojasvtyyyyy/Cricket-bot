@@ -234,7 +234,7 @@ def monitor_comments(subreddit):
 def start_bot():
    while True:
        try:
-           subreddit = reddit.subreddit('cricket2')
+           subreddit = reddit.subreddit('test')
            
            posts_thread = Thread(target=monitor_posts, args=(subreddit,))
            comments_thread = Thread(target=monitor_comments, args=(subreddit,))
