@@ -5,7 +5,7 @@ from flask import Flask, jsonify
 from dotenv import load_dotenv
 import requests
 import time
-from threading import Thread, active_count
+from threading import Thread, active_count, Lock
 import logging
 from prawcore.exceptions import PrawcoreException, ResponseException, RequestException
 from pymongo.errors import PyMongoError
@@ -61,6 +61,7 @@ try:
     
     posts_collection.create_index('post_id', unique=True)
     comments_collection.create_index('comment_id', unique=True)
+    comments_collection.create_index([('timestamp', pymongo.ASCENDING)])
     
 except Exception as e:
     logger.error(f"Failed to connect to MongoDB after all retries: {e}")
@@ -76,27 +77,35 @@ reddit = praw.Reddit(
 class RateLimiter:
     def __init__(self):
         self.last_action_time = {}
+        self.lock = Lock()
+        self.cooldown_periods = {
+            'reddit_comment': 5,    # 5 seconds between comments
+            'reddit_post': 3,       # 3 seconds between post checks
+            'gemini_api': 2         # 2 seconds between API calls
+        }
+        self.recent_actions = []
+        self.max_actions_per_minute = 25  # Reddit's general limit is 30/minute
 
     def can_proceed(self, action_type):
-        try:
+        with self.lock:
             current_time = time.time()
-            last_time = self.last_action_time.get(action_type, 0)
             
-            cooldowns = {
-                'reddit_comment': 3,
-                'reddit_post': 2,
-                'gemini_api': 2
-            }
+            # Clean up old actions
+            self.recent_actions = [t for t in self.recent_actions if current_time - t < 60]
             
-            if current_time - last_time < cooldowns.get(action_type, 2):
+            # Check if we're approaching rate limit
+            if len(self.recent_actions) >= self.max_actions_per_minute:
                 return False
             
-            self.last_action_time[action_type] = current_time
-            return True
+            # Check cooldown period
+            last_time = self.last_action_time.get(action_type, 0)
+            if current_time - last_time < self.cooldown_periods.get(action_type, 3):
+                return False
             
-        except Exception as e:
-            logger.error(f"Rate limiter error: {e}")
-            return False
+            # Update tracking
+            self.last_action_time[action_type] = current_time
+            self.recent_actions.append(current_time)
+            return True
 
 rate_limiter = RateLimiter()
 
@@ -150,84 +159,122 @@ def is_valid_post(post):
         logger.error(f"Error checking post validity: {e}")
         return False
 
-def process_post(post):
+def extract_wait_time_from_error(error_msg):
     try:
-        if posts_collection.find_one({'post_id': post.id}):
-            return
+        # Look for numbers in the error message
+        numbers = [int(s) for s in error_msg.split() if s.isdigit()]
+        if numbers:
+            # Convert to seconds
+            return numbers[0] * 60
+    except:
+        pass
+    return 240  # Default 4 minutes if we can't extract
 
-        post_age = datetime.utcnow() - datetime.fromtimestamp(post.created_utc)
-        if post_age > timedelta(hours=24):
-            return
+def process_post(post):
+    max_retries = 3
+    
+    for retry in range(max_retries):
+        try:
+            if posts_collection.find_one({'post_id': post.id}):
+                return
 
-        if not is_valid_post(post):
-            return
+            post_age = datetime.utcnow() - datetime.fromtimestamp(post.created_utc)
+            if post_age > timedelta(hours=24):
+                return
 
-        if not rate_limiter.can_proceed("reddit_post"):
-            time.sleep(random.uniform(2, 4))
-            return
+            if not is_valid_post(post):
+                return
 
-        text = f"{post.title}\n{post.selftext if post.selftext else ''}"
-        response = get_gemini_response(text)
-        
-        if response:
-            try:
-                comment = post.reply(response)
-                posts_collection.insert_one({
-                    'post_id': post.id,
-                    'comment_id': comment.id,
-                    'timestamp': datetime.utcnow(),
-                    'success': True
-                })
-                logger.info(f"Successfully commented on post: {post.id}")
-            except Exception as e:
-                logger.error(f"Failed to comment on post {post.id}: {e}")
+            if not rate_limiter.can_proceed("reddit_post"):
+                time.sleep(random.uniform(3, 5))
+                continue
+
+            text = f"{post.title}\n{post.selftext if post.selftext else ''}"
+            response = get_gemini_response(text)
+            
+            if response:
+                try:
+                    comment = post.reply(response)
+                    posts_collection.insert_one({
+                        'post_id': post.id,
+                        'comment_id': comment.id,
+                        'timestamp': datetime.utcnow(),
+                        'success': True
+                    })
+                    logger.info(f"Successfully commented on post: {post.id}")
+                    return
+                    
+                except ResponseException as e:
+                    if 'RATELIMIT' in str(e):
+                        wait_time = extract_wait_time_from_error(str(e))
+                        logger.warning(f"Rate limit hit, waiting {wait_time} seconds before retry {retry + 1}")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        raise
+
+        except Exception as e:
+            logger.error(f"Error processing post {post.id}: {e}")
+            if retry < max_retries - 1:
+                time.sleep(random.uniform(5, 8))
+            else:
+                logger.error(f"Failed to process post {post.id} after {max_retries} retries")
                 posts_collection.insert_one({
                     'post_id': post.id,
                     'timestamp': datetime.utcnow(),
                     'success': False,
                     'error': str(e)
                 })
-        else:
-            logger.warning(f"No AI response generated for post {post.id}")
-
-    except Exception as e:
-        logger.error(f"Error processing post {post.id}: {e}")
-        time.sleep(random.uniform(5, 8))
 
 def process_comment(comment):
-    try:
-        if comment.author and comment.author.name == reddit.user.me().name:
-            return
+    max_retries = 3
+    
+    for retry in range(max_retries):
+        try:
+            if comment.author and comment.author.name == reddit.user.me().name:
+                return
 
-        if comments_collection.find_one({'comment_id': comment.id}):
-            return
+            if comments_collection.find_one({'comment_id': comment.id}):
+                return
 
-        if not rate_limiter.can_proceed("reddit_comment"):
-            time.sleep(random.uniform(2, 4))
-            return
+            if not rate_limiter.can_proceed("reddit_comment"):
+                time.sleep(random.uniform(3, 5))
+                continue
 
-        text = comment.body
-        # Handle mention text properly
-        if 'u/cricket_bot' in text.lower():
-            # Remove the mention and clean up extra spaces
-            text = text.lower().replace('u/cricket_bot', '').strip()
-            if not text:  # If only the mention was present
-                text = "Hey"
+            text = comment.body
+            if 'u/cricket_bot' in text.lower():
+                text = text.lower().replace('u/cricket_bot', '').strip()
+                if not text:
+                    text = "Hey"
 
-        response = get_gemini_response(text)
-        if response:
-            reply = comment.reply(response)
-            comments_collection.insert_one({
-                'comment_id': comment.id,
-                'reply_id': reply.id,
-                'timestamp': datetime.utcnow(),
-                'success': True
-            })
-            logger.info(f"Successfully replied to comment: {comment.id}")
+            response = get_gemini_response(text)
+            if response:
+                try:
+                    reply = comment.reply(response)
+                    comments_collection.insert_one({
+                        'comment_id': comment.id,
+                        'reply_id': reply.id,
+                        'timestamp': datetime.utcnow(),
+                        'success': True
+                    })
+                    logger.info(f"Successfully replied to comment: {comment.id}")
+                    return
+                    
+                except ResponseException as e:
+                    if 'RATELIMIT' in str(e):
+                        wait_time = extract_wait_time_from_error(str(e))
+                        logger.warning(f"Rate limit hit, waiting {wait_time} seconds before retry {retry + 1}")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        raise
 
-    except Exception as e:
-        logger.error(f"Error in process_comment: {e}")
-        time.sleep(random.uniform(5, 8))
+        except Exception as e:
+            logger.error(f"Error in process_comment: {e}")
+            if retry < max_retries - 1:
+                time.sleep(random.uniform(5, 8))
+            else:
+                logger.error(f"Failed to process comment {comment.id} after {max_retries} retries")
 
 def monitor_posts(subreddit):
     while True:
@@ -237,7 +284,7 @@ def monitor_posts(subreddit):
                 process_post(post)
         except Exception as e:
             logger.error(f"Error in post stream: {e}")
-            time.sleep(random.uniform(5, 8))
+            time.sleep(random.uniform(5, 8)) 
 
 def monitor_comments(subreddit):
     while True:
@@ -251,6 +298,18 @@ def monitor_comments(subreddit):
             logger.error(f"Error in comment stream: {e}")
             time.sleep(random.uniform(5, 8))
 
+def cleanup_old_records():
+    while True:
+        try:
+            # Keep records for 7 days
+            cutoff_date = datetime.utcnow() - timedelta(days=7)
+            posts_collection.delete_many({'timestamp': {'$lt': cutoff_date}})
+            comments_collection.delete_many({'timestamp': {'$lt': cutoff_date}})
+            time.sleep(86400)  # Run once per day
+        except Exception as e:
+            logger.error(f"Error in cleanup: {e}")
+            time.sleep(3600)  # Wait an hour on error
+
 def start_bot():
     while True:
         try:
@@ -259,12 +318,15 @@ def start_bot():
             
             posts_thread = Thread(target=monitor_posts, args=(subreddit,))
             comments_thread = Thread(target=monitor_comments, args=(subreddit,))
+            cleanup_thread = Thread(target=cleanup_old_records)
             
             posts_thread.daemon = True
             comments_thread.daemon = True
+            cleanup_thread.daemon = True
             
             posts_thread.start()
             comments_thread.start()
+            cleanup_thread.start()
             
             while True:
                 if not posts_thread.is_alive():
@@ -278,6 +340,12 @@ def start_bot():
                     comments_thread = Thread(target=monitor_comments, args=(subreddit,))
                     comments_thread.daemon = True
                     comments_thread.start()
+                
+                if not cleanup_thread.is_alive():
+                    logger.error("Cleanup thread died, restarting...")
+                    cleanup_thread = Thread(target=cleanup_old_records)
+                    cleanup_thread.daemon = True
+                    cleanup_thread.start()
                 
                 time.sleep(60)
             
@@ -323,6 +391,29 @@ def health_check():
     }
 
     return jsonify(response), 200 if status else 503
+
+@app.route('/stats')
+def stats():
+    try:
+        total_posts = posts_collection.count_documents({})
+        successful_posts = posts_collection.count_documents({'success': True})
+        total_comments = comments_collection.count_documents({})
+        
+        last_24h = datetime.utcnow() - timedelta(hours=24)
+        posts_24h = posts_collection.count_documents({'timestamp': {'$gte': last_24h}})
+        comments_24h = comments_collection.count_documents({'timestamp': {'$gte': last_24h}})
+        
+        return jsonify({
+            'total_posts_processed': total_posts,
+            'successful_posts': successful_posts,
+            'total_comments_processed': total_comments,
+            'posts_last_24h': posts_24h,
+            'comments_last_24h': comments_24h,
+            'timestamp': datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     bot_thread = Thread(target=start_bot)
