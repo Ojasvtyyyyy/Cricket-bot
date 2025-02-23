@@ -10,7 +10,7 @@ import logging
 from prawcore.exceptions import PrawcoreException, ResponseException, RequestException
 from pymongo.errors import PyMongoError
 from datetime import datetime, timedelta
-from urllib.parse import quote_plus
+import random
 
 # Set up logging
 logging.basicConfig(
@@ -58,11 +58,9 @@ try:
     mongo_client, db = connect_to_mongodb()
     posts_collection = db['processed_posts']
     comments_collection = db['processed_comments']
-    rate_limits_collection = db['rate_limits']
     
     posts_collection.create_index('post_id', unique=True)
     comments_collection.create_index('comment_id', unique=True)
-    rate_limits_collection.create_index('timestamp', expireAfterSeconds=3600)
     
 except Exception as e:
     logger.error(f"Failed to connect to MongoDB after all retries: {e}")
@@ -76,40 +74,35 @@ reddit = praw.Reddit(
 )
 
 class RateLimiter:
-    def __init__(self, collection, limit_per_minute=30):
-        self.collection = collection
-        self.limit_per_minute = limit_per_minute
+    def __init__(self):
+        self.last_action_time = {}
 
     def can_proceed(self, action_type):
         try:
-            now = datetime.utcnow()
-            one_minute_ago = now - timedelta(minutes=1)
+            current_time = time.time()
+            last_time = self.last_action_time.get(action_type, 0)
             
-            self.collection.delete_many({"timestamp": {"$lt": one_minute_ago}})
+            cooldowns = {
+                'reddit_comment': 3,
+                'reddit_post': 2,
+                'gemini_api': 2
+            }
             
-            recent_count = self.collection.count_documents({
-                "action_type": action_type,
-                "timestamp": {"$gte": one_minute_ago}
-            })
-            
-            if recent_count >= self.limit_per_minute:
+            if current_time - last_time < cooldowns.get(action_type, 2):
                 return False
             
-            self.collection.insert_one({
-                "action_type": action_type,
-                "timestamp": now
-            })
+            self.last_action_time[action_type] = current_time
             return True
-        except PyMongoError as e:
+            
+        except Exception as e:
             logger.error(f"Rate limiter error: {e}")
             return False
 
-rate_limiter = RateLimiter(rate_limits_collection)
+rate_limiter = RateLimiter()
 
 def get_gemini_response(text, max_retries=3):
     if not rate_limiter.can_proceed("gemini_api"):
-        logger.warning("Rate limit reached for Gemini API")
-        time.sleep(60)
+        time.sleep(random.uniform(2, 4))
         return None
         
     retries = 0
@@ -160,30 +153,17 @@ def is_valid_post(post):
 def process_post(post):
     try:
         if posts_collection.find_one({'post_id': post.id}):
-            logger.info(f"Post {post.id} already processed, skipping")
             return
 
         post_age = datetime.utcnow() - datetime.fromtimestamp(post.created_utc)
         if post_age > timedelta(hours=24):
-            logger.info(f"Post {post.id} is too old, skipping")
             return
 
         if not is_valid_post(post):
-            logger.info(f"Post {post.id} is not valid, skipping")
             return
 
-        max_retries = 3
-        retries = 0
-        while retries < max_retries:
-            if rate_limiter.can_proceed("reddit_comment"):
-                break
-            wait_time = 60 * (2 ** retries)
-            logger.warning(f"Rate limit reached, waiting {wait_time} seconds")
-            time.sleep(wait_time)
-            retries += 1
-
-        if retries == max_retries:
-            logger.error("Max retries reached for rate limiting")
+        if not rate_limiter.can_proceed("reddit_post"):
+            time.sleep(random.uniform(2, 4))
             return
 
         text = f"{post.title}\n{post.selftext if post.selftext else ''}"
@@ -212,20 +192,29 @@ def process_post(post):
 
     except Exception as e:
         logger.error(f"Error processing post {post.id}: {e}")
-        time.sleep(30)
+        time.sleep(random.uniform(5, 8))
 
 def process_comment(comment):
     try:
+        if comment.author and comment.author.name == reddit.user.me().name:
+            return
+
         if comments_collection.find_one({'comment_id': comment.id}):
             return
 
         if not rate_limiter.can_proceed("reddit_comment"):
-            logger.warning("Rate limit reached for Reddit comments")
-            time.sleep(60)
+            time.sleep(random.uniform(2, 4))
             return
 
-        response = get_gemini_response(comment.body)
-        
+        text = comment.body
+        # Handle mention text properly
+        if 'u/cricket_bot' in text.lower():
+            # Remove the mention and clean up extra spaces
+            text = text.lower().replace('u/cricket_bot', '').strip()
+            if not text:  # If only the mention was present
+                text = "Hey"
+
+        response = get_gemini_response(text)
         if response:
             reply = comment.reply(response)
             comments_collection.insert_one({
@@ -234,43 +223,33 @@ def process_comment(comment):
                 'timestamp': datetime.utcnow(),
                 'success': True
             })
-            logger.info(f"Successfully processed comment: {comment.id}")
+            logger.info(f"Successfully replied to comment: {comment.id}")
 
     except Exception as e:
         logger.error(f"Error in process_comment: {e}")
-        time.sleep(60)
+        time.sleep(random.uniform(5, 8))
 
 def monitor_posts(subreddit):
     while True:
         try:
             logger.info(f"Starting to monitor posts in r/{subreddit.display_name}")
             for post in subreddit.stream.submissions(skip_existing=True):
-                if is_valid_post(post):
-                    process_post(post)
-                time.sleep(2)
-        except PrawcoreException as e:
-            logger.error(f"Reddit API error in post stream: {e}")
-            time.sleep(60)
+                process_post(post)
         except Exception as e:
-            logger.error(f"Unexpected error in post stream: {e}")
-            time.sleep(30)
+            logger.error(f"Error in post stream: {e}")
+            time.sleep(random.uniform(5, 8))
 
 def monitor_comments(subreddit):
     while True:
         try:
             for comment in subreddit.stream.comments(skip_existing=True):
-                if 'u/cricket-bot' in comment.body.lower():
+                if ('u/cricket_bot' in comment.body.lower() or 
+                    (comment.parent() and isinstance(comment.parent(), praw.models.Comment) and 
+                     comment.parent().author and comment.parent().author.name == reddit.user.me().name)):
                     process_comment(comment)
-                
-                try:
-                    parent = comment.parent()
-                    if isinstance(parent, praw.models.Comment) and parent.author and parent.author.name == reddit.user.me().name:
-                        process_comment(comment)
-                except Exception as e:
-                    logger.error(f"Error checking comment parent: {e}")
         except Exception as e:
             logger.error(f"Error in comment stream: {e}")
-            time.sleep(60)
+            time.sleep(random.uniform(5, 8))
 
 def start_bot():
     while True:
