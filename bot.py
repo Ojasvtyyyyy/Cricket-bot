@@ -42,11 +42,9 @@ def connect_to_mongodb():
                 connectTimeoutMS=20000
             )
             
-            # Explicitly set database name
             db_name = os.getenv('MONGODB_DB_NAME', 'cricket_bot')
             db = client[db_name]
             
-            # Test the connection
             client.admin.command('ping')
             logger.info("Successfully connected to MongoDB")
             return client, db
@@ -64,7 +62,6 @@ try:
     comments_collection = db['processed_comments']
     rate_limits_collection = db['rate_limits']
     
-    # Create indexes for better performance
     posts_collection.create_index('post_id', unique=True)
     comments_collection.create_index('comment_id', unique=True)
     rate_limits_collection.create_index('timestamp', expireAfterSeconds=3600)
@@ -73,13 +70,12 @@ except Exception as e:
     logger.error(f"Failed to connect to MongoDB after all retries: {e}")
     raise
 
-# Initialize Reddit client
+# Initialize Reddit client with OAuth
 reddit = praw.Reddit(
     client_id=os.getenv('REDDIT_CLIENT_ID'),
     client_secret=os.getenv('REDDIT_CLIENT_SECRET'),
-    user_agent=os.getenv('REDDIT_USER_AGENT'),
-    username=os.getenv('REDDIT_USERNAME'),
-    password=os.getenv('REDDIT_PASSWORD')
+    user_agent="Cricket Bot v1.0 by /u/your_username",  # Replace with your username
+    refresh_token=os.getenv('REDDIT_REFRESH_TOKEN')
 )
 
 class RateLimiter:
@@ -92,10 +88,8 @@ class RateLimiter:
             now = datetime.utcnow()
             one_minute_ago = now - timedelta(minutes=1)
             
-            # Clean old entries
             self.collection.delete_many({"timestamp": {"$lt": one_minute_ago}})
             
-            # Count recent actions
             recent_count = self.collection.count_documents({
                 "action_type": action_type,
                 "timestamp": {"$gte": one_minute_ago}
@@ -104,7 +98,6 @@ class RateLimiter:
             if recent_count >= self.limit_per_minute:
                 return False
             
-            # Record new action
             self.collection.insert_one({
                 "action_type": action_type,
                 "timestamp": now
@@ -153,164 +146,195 @@ def get_gemini_response(text, max_retries=3):
             return None
     
     return None 
-    
+
 def process_post(post):
-   try:
-       if posts_collection.find_one({'post_id': post.id}):
-           return
+    try:
+        if posts_collection.find_one({'post_id': post.id}):
+            logger.info(f"Post {post.id} already processed, skipping")
+            return
 
-       if not rate_limiter.can_proceed("reddit_comment"):
-           logger.warning("Rate limit reached for Reddit comments")
-           time.sleep(60)
-           return
+        post_age = datetime.utcnow() - datetime.fromtimestamp(post.created_utc)
+        if post_age > timedelta(hours=24):
+            logger.info(f"Post {post.id} is too old, skipping")
+            return
 
-       text = f"{post.title}\n{post.selftext}"
-       response = get_gemini_response(text)
-       
-       if response:
-           comment = post.reply(response)
-           posts_collection.insert_one({
-               'post_id': post.id,
-               'comment_id': comment.id,
-               'timestamp': datetime.utcnow()
-           })
-           logger.info(f"Successfully processed post: {post.id}")
+        max_retries = 3
+        retries = 0
+        while retries < max_retries:
+            if rate_limiter.can_proceed("reddit_comment"):
+                break
+            wait_time = 60 * (2 ** retries)
+            logger.warning(f"Rate limit reached, waiting {wait_time} seconds")
+            time.sleep(wait_time)
+            retries += 1
 
-   except Exception as e:
-       logger.error(f"Error in process_post: {e}")
-       time.sleep(60)
+        if retries == max_retries:
+            logger.error("Max retries reached for rate limiting")
+            return
+
+        text = f"{post.title}\n{post.selftext if post.selftext else ''}"
+        response = get_gemini_response(text)
+        
+        if response:
+            try:
+                comment = post.reply(response)
+                posts_collection.insert_one({
+                    'post_id': post.id,
+                    'comment_id': comment.id,
+                    'timestamp': datetime.utcnow(),
+                    'success': True
+                })
+                logger.info(f"Successfully commented on post: {post.id}")
+            except Exception as e:
+                logger.error(f"Failed to comment on post {post.id}: {e}")
+                posts_collection.insert_one({
+                    'post_id': post.id,
+                    'timestamp': datetime.utcnow(),
+                    'success': False,
+                    'error': str(e)
+                })
+        else:
+            logger.warning(f"No AI response generated for post {post.id}")
+
+    except Exception as e:
+        logger.error(f"Error processing post {post.id}: {e}")
+        time.sleep(30)
 
 def process_comment(comment):
-   try:
-       if comments_collection.find_one({'comment_id': comment.id}):
-           return
+    try:
+        if comments_collection.find_one({'comment_id': comment.id}):
+            return
 
-       if not rate_limiter.can_proceed("reddit_comment"):
-           logger.warning("Rate limit reached for Reddit comments")
-           time.sleep(60)
-           return
+        if not rate_limiter.can_proceed("reddit_comment"):
+            logger.warning("Rate limit reached for Reddit comments")
+            time.sleep(60)
+            return
 
-       response = get_gemini_response(comment.body)
-       
-       if response:
-           reply = comment.reply(response)
-           comments_collection.insert_one({
-               'comment_id': comment.id,
-               'reply_id': reply.id,
-               'timestamp': datetime.utcnow()
-           })
-           logger.info(f"Successfully processed comment: {comment.id}")
+        response = get_gemini_response(comment.body)
+        
+        if response:
+            reply = comment.reply(response)
+            comments_collection.insert_one({
+                'comment_id': comment.id,
+                'reply_id': reply.id,
+                'timestamp': datetime.utcnow(),
+                'success': True
+            })
+            logger.info(f"Successfully processed comment: {comment.id}")
 
-   except Exception as e:
-       logger.error(f"Error in process_comment: {e}")
-       time.sleep(60)
+    except Exception as e:
+        logger.error(f"Error in process_comment: {e}")
+        time.sleep(60)
 
 def monitor_posts(subreddit):
-   while True:
-       try:
-           for post in subreddit.stream.submissions(skip_existing=True):
-               process_post(post)
-       except Exception as e:
-           logger.error(f"Error in post stream: {e}")
-           time.sleep(60)
+    while True:
+        try:
+            logger.info(f"Starting to monitor posts in r/{subreddit.display_name}")
+            for post in subreddit.stream.submissions(skip_existing=True):
+                if not post.stickied and not post.removed and not post.spam:
+                    process_post(post)
+                time.sleep(2)
+        except PrawcoreException as e:
+            logger.error(f"Reddit API error in post stream: {e}")
+            time.sleep(60)
+        except Exception as e:
+            logger.error(f"Unexpected error in post stream: {e}")
+            time.sleep(30)
 
 def monitor_comments(subreddit):
-   while True:
-       try:
-           for comment in subreddit.stream.comments(skip_existing=True):
-               if 'u/cricket-bot' in comment.body.lower():
-                   process_comment(comment)
-               
-               try:
-                   parent = comment.parent()
-                   if isinstance(parent, praw.models.Comment) and parent.author and parent.author.name == os.getenv('REDDIT_USERNAME'):
-                       process_comment(comment)
-               except Exception as e:
-                   logger.error(f"Error checking comment parent: {e}")
-       except Exception as e:
-           logger.error(f"Error in comment stream: {e}")
-           time.sleep(60)
+    while True:
+        try:
+            for comment in subreddit.stream.comments(skip_existing=True):
+                if 'u/cricket-bot' in comment.body.lower():
+                    process_comment(comment)
+                
+                try:
+                    parent = comment.parent()
+                    if isinstance(parent, praw.models.Comment) and parent.author and parent.author.name == reddit.user.me().name:
+                        process_comment(comment)
+                except Exception as e:
+                    logger.error(f"Error checking comment parent: {e}")
+        except Exception as e:
+            logger.error(f"Error in comment stream: {e}")
+            time.sleep(60)
 
 def start_bot():
-   while True:
-       try:
-           subreddit = reddit.subreddit('test')
-           
-           posts_thread = Thread(target=monitor_posts, args=(subreddit,))
-           comments_thread = Thread(target=monitor_comments, args=(subreddit,))
-           
-           posts_thread.daemon = True
-           comments_thread.daemon = True
-           
-           posts_thread.start()
-           comments_thread.start()
-           
-           # Keep threads alive and monitor their health
-           while True:
-               if not posts_thread.is_alive():
-                   logger.error("Posts thread died, restarting...")
-                   posts_thread = Thread(target=monitor_posts, args=(subreddit,))
-                   posts_thread.daemon = True
-                   posts_thread.start()
-               
-               if not comments_thread.is_alive():
-                   logger.error("Comments thread died, restarting...")
-                   comments_thread = Thread(target=monitor_comments, args=(subreddit,))
-                   comments_thread.daemon = True
-                   comments_thread.start()
-               
-               time.sleep(60)
-           
-       except Exception as e:
-           logger.error(f"Error in main bot loop: {e}")
-           time.sleep(60)
+    while True:
+        try:
+            subreddit_name = os.getenv('SUBREDDIT_NAME', 'cricket')
+            subreddit = reddit.subreddit(subreddit_name)
+            
+            posts_thread = Thread(target=monitor_posts, args=(subreddit,))
+            comments_thread = Thread(target=monitor_comments, args=(subreddit,))
+            
+            posts_thread.daemon = True
+            comments_thread.daemon = True
+            
+            posts_thread.start()
+            comments_thread.start()
+            
+            while True:
+                if not posts_thread.is_alive():
+                    logger.error("Posts thread died, restarting...")
+                    posts_thread = Thread(target=monitor_posts, args=(subreddit,))
+                    posts_thread.daemon = True
+                    posts_thread.start()
+                
+                if not comments_thread.is_alive():
+                    logger.error("Comments thread died, restarting...")
+                    comments_thread = Thread(target=monitor_comments, args=(subreddit,))
+                    comments_thread.daemon = True
+                    comments_thread.start()
+                
+                time.sleep(60)
+            
+        except Exception as e:
+            logger.error(f"Error in main bot loop: {e}")
+            time.sleep(60)
 
 @app.route('/')
 def home():
-   return jsonify({
-       'status': 'running',
-       'timestamp': datetime.utcnow().isoformat()
-   })
+    return jsonify({
+        'status': 'running',
+        'timestamp': datetime.utcnow().isoformat()
+    })
 
 @app.route('/health')
 def health_check():
-   try:
-       # Test MongoDB connection
-       mongo_client.admin.command('ping')
-       db_status = 'connected'
-   except Exception as e:
-       db_status = f'error: {str(e)}'
-       logger.error(f"MongoDB health check failed: {e}")
+    try:
+        mongo_client.admin.command('ping')
+        db_status = 'connected'
+    except Exception as e:
+        db_status = f'error: {str(e)}'
+        logger.error(f"MongoDB health check failed: {e}")
 
-   try:
-       # Test Reddit connection
-       reddit.user.me()
-       reddit_status = 'connected'
-   except Exception as e:
-       reddit_status = f'error: {str(e)}'
-       logger.error(f"Reddit health check failed: {e}")
+    try:
+        reddit.user.me()
+        reddit_status = 'connected'
+    except Exception as e:
+        reddit_status = f'error: {str(e)}'
+        logger.error(f"Reddit health check failed: {e}")
 
-   # Test bot threads
-   threads_status = 'running' if Thread.active_count() > 1 else 'error: no bot threads'
+    threads_status = 'running' if Thread.active_count() > 1 else 'error: no bot threads'
 
-   status = all(x == 'connected' for x in [db_status, reddit_status]) and threads_status == 'running'
+    status = all(x == 'connected' for x in [db_status, reddit_status]) and threads_status == 'running'
 
-   response = {
-       'status': 'healthy' if status else 'unhealthy',
-       'timestamp': datetime.utcnow().isoformat(),
-       'details': {
-           'mongodb': db_status,
-           'reddit': reddit_status,
-           'bot_threads': threads_status
-       }
-   }
+    response = {
+        'status': 'healthy' if status else 'unhealthy',
+        'timestamp': datetime.utcnow().isoformat(),
+        'details': {
+            'mongodb': db_status,
+            'reddit': reddit_status,
+            'bot_threads': threads_status
+        }
+    }
 
-   return jsonify(response), 200 if status else 503
+    return jsonify(response), 200 if status else 503
 
 if __name__ == '__main__':
-   bot_thread = Thread(target=start_bot)
-   bot_thread.daemon = True
-   bot_thread.start()
-   
-   port = int(os.getenv('PORT', 5000))
-   app.run(host='0.0.0.0', port=port)
+    bot_thread = Thread(target=start_bot)
+    bot_thread.daemon = True
+    bot_thread.start()
+    
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
