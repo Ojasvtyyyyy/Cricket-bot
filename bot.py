@@ -5,7 +5,7 @@ from flask import Flask, jsonify
 from dotenv import load_dotenv
 import requests
 import time
-from threading import Thread
+from threading import Thread, active_count
 import logging
 from prawcore.exceptions import PrawcoreException, ResponseException, RequestException
 from pymongo.errors import PyMongoError
@@ -146,13 +146,12 @@ def get_gemini_response(text, max_retries=3):
 
 def is_valid_post(post):
     try:
-        # Check if post is available and not removed/deleted
         return (
-            not post.stickied and  # Not a sticky post
-            hasattr(post, 'author') and  # Has author
-            post.author is not None and  # Author not deleted
-            not post.locked and  # Not locked
-            not hasattr(post, 'removed_by_category')  # Not removed
+            not post.stickied and
+            hasattr(post, 'author') and
+            post.author is not None and
+            not post.locked and
+            not hasattr(post, 'removed_by_category')
         )
     except Exception as e:
         logger.error(f"Error checking post validity: {e}")
@@ -330,7 +329,7 @@ def health_check():
         reddit_status = f'error: {str(e)}'
         logger.error(f"Reddit health check failed: {e}")
 
-    threads_status = 'running' if Thread.active_count() > 1 else 'error: no bot threads'
+    threads_status = 'running' if active_count() > 1 else 'error: no bot threads'
 
     status = all(x == 'connected' for x in [db_status, reddit_status]) and threads_status == 'running'
 
