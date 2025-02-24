@@ -274,27 +274,27 @@ class Bot:
         self.processor = ContentProcessor(self.db_manager, self.reddit_manager)
         
     def monitor_posts(self, subreddit):
-    bot_status['posts_monitor'] = True
-    
-    while not shutdown_event.is_set():
-        try:
-            logger.info(f"Starting to monitor posts in r/{subreddit.display_name}")
-            
-            # Use stream instead of polling new
-            for post in subreddit.stream.submissions(skip_existing=True):
-                if shutdown_event.is_set():
-                    break
+        bot_status['posts_monitor'] = True
+        
+        while not shutdown_event.is_set():
+            try:
+                logger.info(f"Starting to monitor posts in r/{subreddit.display_name}")
                 
-                try:
-                    self.processor.process_post(post)
-                except Exception as e:
-                    logger.error(f"Error processing post {post.id}: {e}")
-                
-                time.sleep(2)  # Small delay between posts
-                
-        except Exception as e:
-            logger.error(f"Error in post stream: {e}")
-            time.sleep(random.uniform(5, 8))
+                # Use streaming API for posts
+                for post in subreddit.stream.submissions(skip_existing=True):
+                    if shutdown_event.is_set():
+                        break
+                        
+                    try:
+                        self.processor.process_post(post)
+                    except Exception as e:
+                        logger.error(f"Error processing individual post {post.id}: {e}")
+                    
+                    time.sleep(2)  # Delay between posts
+                    
+            except Exception as e:
+                logger.error(f"Error in post stream: {e}")
+                time.sleep(random.uniform(5, 8))
 
     def monitor_comments(self, subreddit):
         bot_status['comments_monitor'] = True
