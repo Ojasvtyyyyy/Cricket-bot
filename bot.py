@@ -274,38 +274,27 @@ class Bot:
         self.processor = ContentProcessor(self.db_manager, self.reddit_manager)
         
     def monitor_posts(self, subreddit):
-        bot_status['posts_monitor'] = True
-        last_processed_time = datetime.utcnow()
-        
-        while not shutdown_event.is_set():
-            try:
-                logger.info(f"Starting to monitor posts in r/{subreddit.display_name}")
+    bot_status['posts_monitor'] = True
+    
+    while not shutdown_event.is_set():
+        try:
+            logger.info(f"Starting to monitor posts in r/{subreddit.display_name}")
+            
+            # Use stream instead of polling new
+            for post in subreddit.stream.submissions(skip_existing=True):
+                if shutdown_event.is_set():
+                    break
                 
-                # Get new submissions
-                for post in subreddit.new(limit=10):
-                    if shutdown_event.is_set():
-                        break
-                    
-                    # Skip posts older than last check
-                    post_time = datetime.fromtimestamp(post.created_utc)
-                    if post_time < last_processed_time:
-                        continue
-                        
-                    try:
-                        # Process each post
-                        self.processor.process_post(post)
-                    except Exception as e:
-                        logger.error(f"Error processing individual post {post.id}: {e}")
-                    
-                    time.sleep(2)  # Delay between posts
+                try:
+                    self.processor.process_post(post)
+                except Exception as e:
+                    logger.error(f"Error processing post {post.id}: {e}")
                 
-                last_processed_time = datetime.utcnow()
-                # Wait before checking for new posts again
-                time.sleep(30)  # Check every 30 seconds
+                time.sleep(2)  # Small delay between posts
                 
-            except Exception as e:
-                logger.error(f"Error in post stream: {e}")
-                time.sleep(random.uniform(5, 8))
+        except Exception as e:
+            logger.error(f"Error in post stream: {e}")
+            time.sleep(random.uniform(5, 8))
 
     def monitor_comments(self, subreddit):
         bot_status['comments_monitor'] = True
