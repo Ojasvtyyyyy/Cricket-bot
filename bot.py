@@ -1,7 +1,7 @@
 import praw
 import pymongo
 import os
-from flask import Flask, jsonify
+from flask import Flask, jsonify, make_response
 from dotenv import load_dotenv
 import requests
 import time
@@ -12,6 +12,7 @@ from pymongo.errors import PyMongoError
 from datetime import datetime, timedelta
 import random
 import backoff
+import socket
 
 # Enhanced logging setup
 logging.basicConfig(
@@ -27,8 +28,15 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 app = Flask(__name__)
 
-# Global shutdown event
+# Global shutdown event and status tracker
 shutdown_event = Event()
+bot_status = {
+    'posts_monitor': False,
+    'comments_monitor': False,
+    'cleanup': False,
+    'last_post_time': None,
+    'last_comment_time': None
+}
 
 class DatabaseManager:
     def __init__(self):
@@ -64,41 +72,57 @@ class DatabaseManager:
             
             self.client.admin.command('ping')
             logger.info("Successfully connected to MongoDB")
+            return True
             
         except Exception as e:
             logger.error(f"MongoDB connection failed: {e}")
-            raise
+            return False
 
     def reconnect_if_needed(self):
         try:
             self.client.admin.command('ping')
+            return True
         except:
             logger.warning("MongoDB connection lost, reconnecting...")
-            self.connect()
+            return self.connect()
 
 class RedditManager:
     def __init__(self):
         self.reddit = None
         self.connect()
+        self.last_reconnect = time.time()
 
     @backoff.on_exception(backoff.expo, Exception, max_tries=5)
     def connect(self):
-        self.reddit = praw.Reddit(
-            client_id=os.getenv('REDDIT_CLIENT_ID'),
-            client_secret=os.getenv('REDDIT_CLIENT_SECRET'),
-            user_agent=os.getenv('REDDIT_USER_AGENT'),
-            refresh_token=os.getenv('REDDIT_REFRESH_TOKEN')
-        )
-        # Verify connection
-        self.reddit.user.me()
-        logger.info("Successfully connected to Reddit")
+        try:
+            self.reddit = praw.Reddit(
+                client_id=os.getenv('REDDIT_CLIENT_ID'),
+                client_secret=os.getenv('REDDIT_CLIENT_SECRET'),
+                user_agent=os.getenv('REDDIT_USER_AGENT'),
+                refresh_token=os.getenv('REDDIT_REFRESH_TOKEN')
+            )
+            # Verify connection
+            self.reddit.user.me()
+            logger.info("Successfully connected to Reddit")
+            return True
+        except Exception as e:
+            logger.error(f"Reddit connection failed: {e}")
+            return False
 
     def reconnect_if_needed(self):
-        try:
-            self.reddit.user.me()
-        except:
-            logger.warning("Reddit connection lost, reconnecting...")
-            self.connect()
+        current_time = time.time()
+        # Only reconnect if more than 5 minutes have passed since last reconnect
+        if current_time - self.last_reconnect > 300:
+            try:
+                self.reddit.user.me()
+                return True
+            except:
+                logger.warning("Reddit connection lost, reconnecting...")
+                success = self.connect()
+                if success:
+                    self.last_reconnect = current_time
+                return success
+        return True
 
 class ContentProcessor:
     def __init__(self, db_manager, reddit_manager):
@@ -130,19 +154,23 @@ class ContentProcessor:
         return response.json()['candidates'][0]['content']['parts'][0]['text']
 
     def is_valid_post(self, post):
-        return (
-            not post.stickied and
-            hasattr(post, 'author') and
-            post.author is not None and
-            not post.locked and
-            not hasattr(post, 'removed_by_category')
-        )
+        try:
+            return (
+                not post.stickied and
+                hasattr(post, 'author') and
+                post.author is not None and
+                not post.locked and
+                not hasattr(post, 'removed_by_category')
+            )
+        except Exception as e:
+            logger.error(f"Error checking post validity: {e}")
+            return False
 
     @backoff.on_exception(backoff.expo, Exception, max_tries=3)
     def process_post(self, post):
         try:
-            self.db_manager.reconnect_if_needed()
-            self.reddit_manager.reconnect_if_needed()
+            if not self.db_manager.reconnect_if_needed() or not self.reddit_manager.reconnect_if_needed():
+                return
 
             if self.db_manager.posts_collection.find_one({'post_id': post.id}):
                 return
@@ -158,29 +186,37 @@ class ContentProcessor:
             response = self.get_gemini_response(text)
             
             if response:
-                comment = post.reply(response)
-                self.db_manager.posts_collection.insert_one({
-                    'post_id': post.id,
-                    'comment_id': comment.id,
-                    'timestamp': datetime.utcnow(),
-                    'success': True
-                })
-                logger.info(f"Successfully commented on post: {post.id}")
+                try:
+                    comment = post.reply(response)
+                    self.db_manager.posts_collection.insert_one({
+                        'post_id': post.id,
+                        'comment_id': comment.id,
+                        'timestamp': datetime.utcnow(),
+                        'success': True
+                    })
+                    logger.info(f"Successfully commented on post: {post.id}")
+                    bot_status['last_post_time'] = datetime.utcnow()
+                except Exception as e:
+                    logger.error(f"Failed to comment on post {post.id}: {e}")
+                    raise
 
         except Exception as e:
             logger.error(f"Error processing post {post.id}: {e}")
-            self.db_manager.posts_collection.insert_one({
-                'post_id': post.id,
-                'timestamp': datetime.utcnow(),
-                'success': False,
-                'error': str(e)
-            })
+            try:
+                self.db_manager.posts_collection.insert_one({
+                    'post_id': post.id,
+                    'timestamp': datetime.utcnow(),
+                    'success': False,
+                    'error': str(e)
+                })
+            except Exception as db_error:
+                logger.error(f"Failed to log post error to database: {db_error}")
 
     @backoff.on_exception(backoff.expo, Exception, max_tries=3)
     def process_comment(self, comment):
         try:
-            self.db_manager.reconnect_if_needed()
-            self.reddit_manager.reconnect_if_needed()
+            if not self.db_manager.reconnect_if_needed() or not self.reddit_manager.reconnect_if_needed():
+                return
 
             if comment.author and comment.author.name == self.reddit_manager.reddit.user.me().name:
                 return
@@ -196,14 +232,19 @@ class ContentProcessor:
 
             response = self.get_gemini_response(text)
             if response:
-                reply = comment.reply(response)
-                self.db_manager.comments_collection.insert_one({
-                    'comment_id': comment.id,
-                    'reply_id': reply.id,
-                    'timestamp': datetime.utcnow(),
-                    'success': True
-                })
-                logger.info(f"Successfully replied to comment: {comment.id}")
+                try:
+                    reply = comment.reply(response)
+                    self.db_manager.comments_collection.insert_one({
+                        'comment_id': comment.id,
+                        'reply_id': reply.id,
+                        'timestamp': datetime.utcnow(),
+                        'success': True
+                    })
+                    logger.info(f"Successfully replied to comment: {comment.id}")
+                    bot_status['last_comment_time'] = datetime.utcnow()
+                except Exception as e:
+                    logger.error(f"Failed to reply to comment {comment.id}: {e}")
+                    raise
 
         except Exception as e:
             logger.error(f"Error processing comment {comment.id}: {e}")
@@ -215,6 +256,7 @@ class Bot:
         self.processor = ContentProcessor(self.db_manager, self.reddit_manager)
         
     def monitor_posts(self, subreddit):
+        bot_status['posts_monitor'] = True
         while not shutdown_event.is_set():
             try:
                 logger.info(f"Starting to monitor posts in r/{subreddit.display_name}")
@@ -222,11 +264,14 @@ class Bot:
                     if shutdown_event.is_set():
                         break
                     self.processor.process_post(post)
+                    time.sleep(1)  # Small delay to prevent overwhelming the API
             except Exception as e:
                 logger.error(f"Error in post stream: {e}")
                 time.sleep(random.uniform(5, 8))
+        bot_status['posts_monitor'] = False
 
     def monitor_comments(self, subreddit):
+        bot_status['comments_monitor'] = True
         while not shutdown_event.is_set():
             try:
                 for comment in subreddit.stream.comments(skip_existing=True):
@@ -236,11 +281,14 @@ class Bot:
                         (comment.parent() and isinstance(comment.parent(), praw.models.Comment) and 
                          comment.parent().author and comment.parent().author.name == self.reddit_manager.reddit.user.me().name)):
                         self.processor.process_comment(comment)
+                        time.sleep(1)  # Small delay to prevent overwhelming the API
             except Exception as e:
                 logger.error(f"Error in comment stream: {e}")
                 time.sleep(random.uniform(5, 8))
+        bot_status['comments_monitor'] = False
 
     def cleanup_old_records(self):
+        bot_status['cleanup'] = True
         while not shutdown_event.is_set():
             try:
                 cutoff_date = datetime.utcnow() - timedelta(days=7)
@@ -250,6 +298,7 @@ class Bot:
             except Exception as e:
                 logger.error(f"Error in cleanup: {e}")
                 time.sleep(3600)
+        bot_status['cleanup'] = False
 
     def start(self):
         try:
@@ -286,40 +335,71 @@ class Bot:
 def create_app():
     bot = Bot()
     
-    @app.route('/')
+    @app.route('/', methods=['GET', 'HEAD'])
     def home():
-        return jsonify({
+        response = make_response(jsonify({
             'status': 'running',
             'timestamp': datetime.utcnow().isoformat()
-        })
+        }))
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        return response
 
     @app.route('/health')
     def health_check():
         try:
-            bot.db_manager.client.admin.command('ping')
-            db_status = 'connected'
+            # Check MongoDB connection
+            db_status = 'connected' if bot.db_manager.reconnect_if_needed() else 'disconnected'
+            
+            # Check Reddit connection
+            reddit_status = 'connected' if bot.reddit_manager.reconnect_if_needed() else 'disconnected'
+            
+            # Check bot threads
+            threads_healthy = all([
+                bot_status['posts_monitor'],
+                bot_status['comments_monitor'],
+                bot_status['cleanup']
+            ])
+            
+            # Check recent activity
+            now = datetime.utcnow()
+            last_post = bot_status['last_post_time']
+            last_comment = bot_status['last_comment_time']
+            
+            activity_status = 'active'
+            if last_post and (now - last_post) > timedelta(hours=1):
+                activity_status = 'inactive'
+            if last_comment and (now - last_comment) > timedelta(hours=1):
+                activity_status = 'inactive'
+
+            status = all([
+                db_status == 'connected',
+                reddit_status == 'connected',
+                threads_healthy,
+                activity_status == 'active'
+            ])
+
+            response = make_response(jsonify({
+                'status': 'healthy' if status else 'unhealthy',
+                'timestamp': datetime.utcnow().isoformat(),
+                'details': {
+                    'mongodb': db_status,
+                    'reddit': reddit_status,
+                    'bot_threads': 'running' if threads_healthy else 'error',
+                    'activity': activity_status
+                }
+            }))
+            
+            response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+            response.headers['Pragma'] = 'no-cache'
+            response.headers['Expires'] = '0'
+            
+            return response
+
         except Exception as e:
-            db_status = f'error: {str(e)}'
-
-        try:
-            bot.reddit_manager.reddit.user.me()
-            reddit_status = 'connected'
-        except Exception as e:
-            reddit_status = f'error: {str(e)}'
-
-        threads_status = 'running' if active_count() > 1 else 'error: no bot threads'
-
-        status = all(x == 'connected' for x in [db_status, reddit_status]) and threads_status == 'running'
-
-        return jsonify({
-            'status': 'healthy' if status else 'unhealthy',
-            'timestamp': datetime.utcnow().isoformat(),
-            'details': {
-                'mongodb': db_status,
-                'reddit': reddit_status,
-                'bot_threads': threads_status
-            }
-        }), 200 if status else 503
+            logger.error(f"Health check failed: {e}")
+            return jsonify({'error': str(e)}), 500
 
     @app.route('/stats')
     def stats():
@@ -332,26 +412,44 @@ def create_app():
             posts_24h = bot.db_manager.posts_collection.count_documents({'timestamp': {'$gte': last_24h}})
             comments_24h = bot.db_manager.comments_collection.count_documents({'timestamp': {'$gte': last_24h}})
             
-            return jsonify({
+            response = make_response(jsonify({
                 'total_posts_processed': total_posts,
                 'successful_posts': successful_posts,
                 'total_comments_processed': total_comments,
                 'posts_last_24h': posts_24h,
                 'comments_last_24h': comments_24h,
                 'timestamp': datetime.utcnow().isoformat()
-            })
+            }))
+            
+            response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+            response.headers['Pragma'] = 'no-cache'
+            response.headers['Expires'] = '0'
+            
+            return response
+            
         except Exception as e:
             logger.error(f"Error getting stats: {e}")
             return jsonify({'error': str(e)}), 500
 
     return app, bot
 
+def main():
+    try:
+        app, bot = create_app()
+        
+        bot_thread = Thread(target=bot.start, name="BotMain")
+        bot_thread.daemon = True
+        bot_thread.start()
+        
+        # Enable socket timeout
+        socket.setdefaulttimeout(30)
+        
+        port = int(os.getenv('PORT', 5000))
+        app.run(host='0.0.0.0', port=port, threaded=True)
+        
+    except Exception as e:
+        logger.error(f"Application startup failed: {e}")
+        raise
+
 if __name__ == '__main__':
-    app, bot = create_app()
-    
-    bot_thread = Thread(target=bot.start)
-    bot_thread.daemon = True
-    bot_thread.start()
-    
-    port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    main()
