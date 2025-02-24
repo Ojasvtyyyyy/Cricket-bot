@@ -167,50 +167,59 @@ class ContentProcessor:
             return False
 
     @backoff.on_exception(backoff.expo, Exception, max_tries=3)
-    def process_post(self, post):
-        try:
-            if not self.db_manager.reconnect_if_needed() or not self.reddit_manager.reconnect_if_needed():
-                return
+def process_post(self, post):
+    try:
+        if not self.db_manager.reconnect_if_needed() or not self.reddit_manager.reconnect_if_needed():
+            logger.error("Failed to reconnect to services")
+            return
 
-            if self.db_manager.posts_collection.find_one({'post_id': post.id}):
-                return
+        # Log post details
+        logger.info(f"Processing post {post.id}: {post.title}")
 
-            post_age = datetime.utcnow() - datetime.fromtimestamp(post.created_utc)
-            if post_age > timedelta(hours=24):
-                return
+        if self.db_manager.posts_collection.find_one({'post_id': post.id}):
+            logger.info(f"Post {post.id} already processed")
+            return
 
-            if not self.is_valid_post(post):
-                return
+        post_age = datetime.utcnow() - datetime.fromtimestamp(post.created_utc)
+        if post_age > timedelta(hours=24):
+            logger.info(f"Post {post.id} too old: {post_age}")
+            return
 
-            text = f"{post.title}\n{post.selftext if post.selftext else ''}"
-            response = self.get_gemini_response(text)
-            
-            if response:
-                try:
-                    comment = post.reply(response)
-                    self.db_manager.posts_collection.insert_one({
-                        'post_id': post.id,
-                        'comment_id': comment.id,
-                        'timestamp': datetime.utcnow(),
-                        'success': True
-                    })
-                    logger.info(f"Successfully commented on post: {post.id}")
-                    bot_status['last_post_time'] = datetime.utcnow()
-                except Exception as e:
-                    logger.error(f"Failed to comment on post {post.id}: {e}")
-                    raise
+        if not self.is_valid_post(post):
+            logger.info(f"Post {post.id} invalid")
+            return
 
-        except Exception as e:
-            logger.error(f"Error processing post {post.id}: {e}")
+        text = f"{post.title}\n{post.selftext if post.selftext else ''}"
+        response = self.get_gemini_response(text)
+        
+        if response:
             try:
+                comment = post.reply(response)
                 self.db_manager.posts_collection.insert_one({
                     'post_id': post.id,
+                    'comment_id': comment.id,
                     'timestamp': datetime.utcnow(),
-                    'success': False,
-                    'error': str(e)
+                    'success': True
                 })
-            except Exception as db_error:
-                logger.error(f"Failed to log post error to database: {db_error}")
+                logger.info(f"Successfully commented on post: {post.id}")
+                bot_status['last_post_time'] = datetime.utcnow()
+            except Exception as e:
+                logger.error(f"Failed to comment on post {post.id}: {e}")
+                raise
+        else:
+            logger.error(f"No response generated for post {post.id}")
+
+    except Exception as e:
+        logger.error(f"Error processing post {post.id}: {e}")
+        try:
+            self.db_manager.posts_collection.insert_one({
+                'post_id': post.id,
+                'timestamp': datetime.utcnow(),
+                'success': False,
+                'error': str(e)
+            })
+        except Exception as db_error:
+            logger.error(f"Failed to log post error to database: {db_error}")
 
     @backoff.on_exception(backoff.expo, Exception, max_tries=3)
     def process_comment(self, comment):
@@ -256,36 +265,59 @@ class Bot:
         self.processor = ContentProcessor(self.db_manager, self.reddit_manager)
         
     def monitor_posts(self, subreddit):
-        bot_status['posts_monitor'] = True
-        while not shutdown_event.is_set():
-            try:
-                logger.info(f"Starting to monitor posts in r/{subreddit.display_name}")
-                for post in subreddit.stream.submissions(skip_existing=True):
-                    if shutdown_event.is_set():
-                        break
+    bot_status['posts_monitor'] = True
+    while not shutdown_event.is_set():
+        try:
+            logger.info(f"Starting to monitor posts in r/{subreddit.display_name}")
+            
+            # Get new submissions
+            for post in subreddit.new(limit=10):
+                if shutdown_event.is_set():
+                    break
+                    
+                try:
+                    # Process each post
                     self.processor.process_post(post)
-                    time.sleep(1)  # Small delay to prevent overwhelming the API
-            except Exception as e:
-                logger.error(f"Error in post stream: {e}")
-                time.sleep(random.uniform(5, 8))
-        bot_status['posts_monitor'] = False
+                except Exception as e:
+                    logger.error(f"Error processing individual post {post.id}: {e}")
+                
+                time.sleep(2)  # Delay between posts
+            
+            # Wait before checking for new posts again
+            time.sleep(30)  # Check every 30 seconds
+            
+        except Exception as e:
+            logger.error(f"Error in post stream: {e}")
+            time.sleep(random.uniform(5, 8))
 
     def monitor_comments(self, subreddit):
-        bot_status['comments_monitor'] = True
-        while not shutdown_event.is_set():
-            try:
-                for comment in subreddit.stream.comments(skip_existing=True):
-                    if shutdown_event.is_set():
-                        break
-                    if ('u/cricket_bot' in comment.body.lower() or 
-                        (comment.parent() and isinstance(comment.parent(), praw.models.Comment) and 
-                         comment.parent().author and comment.parent().author.name == self.reddit_manager.reddit.user.me().name)):
+    bot_status['comments_monitor'] = True
+    while not shutdown_event.is_set():
+        try:
+            for comment in subreddit.stream.comments(skip_existing=True):
+                if shutdown_event.is_set():
+                    break
+                
+                # Check for mentions
+                if 'u/cricket_bot' in comment.body.lower():
+                    self.processor.process_comment(comment)
+                    continue
+                
+                # Check for replies to bot's comments
+                try:
+                    parent = comment.parent()
+                    if (isinstance(parent, praw.models.Comment) and 
+                        parent.author and 
+                        parent.author.name == self.reddit_manager.reddit.user.me().name):
                         self.processor.process_comment(comment)
-                        time.sleep(1)  # Small delay to prevent overwhelming the API
-            except Exception as e:
-                logger.error(f"Error in comment stream: {e}")
-                time.sleep(random.uniform(5, 8))
-        bot_status['comments_monitor'] = False
+                except Exception as e:
+                    logger.error(f"Error checking parent comment: {e}")
+                
+                time.sleep(1)  # Small delay
+                
+        except Exception as e:
+            logger.error(f"Error in comment stream: {e}")
+            time.sleep(random.uniform(5, 8))
 
     def cleanup_old_records(self):
         bot_status['cleanup'] = True
