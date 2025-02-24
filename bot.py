@@ -167,8 +167,8 @@ class ContentProcessor:
             if post.locked:
                 logger.info(f"Post {post.id} is locked")
                 return False
-            if hasattr(post, 'removed_by_category'):
-                logger.info(f"Post {post.id} was removed")
+            if hasattr(post, 'removed_by_category') and post.removed_by_category is not None:
+                logger.info(f"Post {post.id} was removed with category: {post.removed_by_category}")
                 return False
             return True
         except Exception as e:
