@@ -154,26 +154,26 @@ class ContentProcessor:
         return response.json()['candidates'][0]['content']['parts'][0]['text']
 
     def is_valid_post(self, post):
-    try:
-        if post.stickied:
-            logger.info(f"Post {post.id} is stickied")
+        try:
+            if post.stickied:
+                logger.info(f"Post {post.id} is stickied")
+                return False
+            if not hasattr(post, 'author'):
+                logger.info(f"Post {post.id} has no author attribute")
+                return False
+            if post.author is None:
+                logger.info(f"Post {post.id} author is None")
+                return False
+            if post.locked:
+                logger.info(f"Post {post.id} is locked")
+                return False
+            if hasattr(post, 'removed_by_category'):
+                logger.info(f"Post {post.id} was removed")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Error checking post validity: {e}")
             return False
-        if not hasattr(post, 'author'):
-            logger.info(f"Post {post.id} has no author attribute")
-            return False
-        if post.author is None:
-            logger.info(f"Post {post.id} author is None")
-            return False
-        if post.locked:
-            logger.info(f"Post {post.id} is locked")
-            return False
-        if hasattr(post, 'removed_by_category'):
-            logger.info(f"Post {post.id} was removed")
-            return False
-        return True
-    except Exception as e:
-        logger.error(f"Error checking post validity: {e}")
-        return False
 
     @backoff.on_exception(backoff.expo, Exception, max_tries=3)
     def process_post(self, post):
@@ -274,38 +274,38 @@ class Bot:
         self.processor = ContentProcessor(self.db_manager, self.reddit_manager)
         
     def monitor_posts(self, subreddit):
-    bot_status['posts_monitor'] = True
-    last_processed_time = datetime.utcnow()
-    
-    while not shutdown_event.is_set():
-        try:
-            logger.info(f"Starting to monitor posts in r/{subreddit.display_name}")
-            
-            # Get new submissions
-            for post in subreddit.new(limit=10):
-                if shutdown_event.is_set():
-                    break
+        bot_status['posts_monitor'] = True
+        last_processed_time = datetime.utcnow()
+        
+        while not shutdown_event.is_set():
+            try:
+                logger.info(f"Starting to monitor posts in r/{subreddit.display_name}")
                 
-                # Skip posts older than last check
-                post_time = datetime.fromtimestamp(post.created_utc)
-                if post_time < last_processed_time:
-                    continue
+                # Get new submissions
+                for post in subreddit.new(limit=10):
+                    if shutdown_event.is_set():
+                        break
+                    
+                    # Skip posts older than last check
+                    post_time = datetime.fromtimestamp(post.created_utc)
+                    if post_time < last_processed_time:
+                        continue
                         
-                try:
-                    # Process each post
-                    self.processor.process_post(post)
-                except Exception as e:
-                    logger.error(f"Error processing individual post {post.id}: {e}")
+                    try:
+                        # Process each post
+                        self.processor.process_post(post)
+                    except Exception as e:
+                        logger.error(f"Error processing individual post {post.id}: {e}")
+                    
+                    time.sleep(2)  # Delay between posts
                 
-                time.sleep(2)  # Delay between posts
-            
-            last_processed_time = datetime.utcnow()
-            # Wait before checking for new posts again
-            time.sleep(30)  # Check every 30 seconds
-            
-        except Exception as e:
-            logger.error(f"Error in post stream: {e}")
-            time.sleep(random.uniform(5, 8))
+                last_processed_time = datetime.utcnow()
+                # Wait before checking for new posts again
+                time.sleep(30)  # Check every 30 seconds
+                
+            except Exception as e:
+                logger.error(f"Error in post stream: {e}")
+                time.sleep(random.uniform(5, 8))
 
     def monitor_comments(self, subreddit):
         bot_status['comments_monitor'] = True
